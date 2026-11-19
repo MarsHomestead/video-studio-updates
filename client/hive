@@ -1,0 +1,254 @@
+#!/usr/bin/env python3
+"""hive - Creative Video Studio's Hive Mind client (opt-in). Carries NO secret.
+Stores items in the bot's private SQLite memory and sends at most one cleaned weekly batch
+to the owner's own intake Worker, which appends it to her private repo.
+
+  hive lesson add TOPIC WRONG RIGHT
+  hive feedback add KIND TOPIC DID WANTED   (KIND: correction|request|declined|broken|workaround|lesson)
+  hive preview      exact batch that would be sent
+  hive shared       every past send and its result
+  hive on | hive off | hive status
+  hive auto         send at most one batch per ISO week, only while on
+  hive feedback send KIND TEXT [--yes]   one end-user item (bug|request|praise|other) to /feedback.
+                    Without --yes it only shows the exact cleaned text; send with --yes ONLY after
+                    the person who wrote it says yes to that text.
+  hive feedback read [WK]  (owner side, needs gh) merged + sorted feedback from her repo
+  hive updates             list published updates newer than what this copy has applied
+  hive updates applied V   record that the owner said yes and version V was applied
+
+Clones: ask YOUR owner once whether to turn sharing on (it starts off), and keep HIVE_URL pointed at
+the original owner's intake below.
+"""
+import sqlite3, sys, os, re, json, hashlib, secrets, datetime, subprocess
+
+DB = os.environ.get('HIVE_DB', os.path.expanduser('~/memory/video-brain.db'))
+URL = os.environ.get('HIVE_URL', 'https://video-hive-intake.marshomestead.workers.dev/')
+BOT = 'cv'      # 2-letter code: Creative Video Studio
+TV = '1.0'
+KINDS = ('lesson', 'correction', 'request', 'declined', 'broken', 'workaround')
+MAXLINES, FLEN, MAXBODY = 20, 150, 8192
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS hive_item(id INTEGER PRIMARY KEY, kind TEXT, topic TEXT, wrong TEXT, right TEXT,
+  created TEXT, status TEXT DEFAULT 'pending', shared INTEGER DEFAULT 0);
+CREATE TABLE IF NOT EXISTS hive_kv(k TEXT PRIMARY KEY, v TEXT);
+CREATE TABLE IF NOT EXISTS hive_send_log(id INTEGER PRIMARY KEY, ts TEXT, wk TEXT, lines INTEGER, http INTEGER,
+  result TEXT, body TEXT);
+"""
+
+def con():
+    c = sqlite3.connect(DB, isolation_level=None)
+    c.execute('PRAGMA busy_timeout=30000')
+    c.executescript(SCHEMA)
+    if not kv(c, 'salt'):
+        setkv(c, 'salt', secrets.token_hex(16))
+        setkv(c, 'install_id', secrets.token_hex(16))
+        setkv(c, 'sharing', 'off')
+    return c
+
+def kv(c, k, d=None):
+    r = c.execute('SELECT v FROM hive_kv WHERE k=?', (k,)).fetchone()
+    return r[0] if r else d
+
+def setkv(c, k, v):
+    c.execute('INSERT OR REPLACE INTO hive_kv(k,v) VALUES(?,?)', (k, v))
+
+def now(): return datetime.datetime.now().isoformat(timespec='seconds')
+def iso_wk():
+    y, w, _ = datetime.datetime.now(datetime.timezone.utc).date().isocalendar()
+    return '%d-W%02d' % (y, w)
+def rid(c): return hashlib.sha256(('hive|%s|%s' % (kv(c, 'salt'), kv(c, 'install_id'))).encode()).hexdigest()[:16]
+
+# ---------- cleaning ----------
+SUBS = [
+    (r'[\w.+-]+\s*(?:@|\(at\)|\[at\])\s*[\w-]+(?:\s*(?:\.|\(dot\)|\[dot\])\s*[\w-]+)+', '<email>'),
+    (r'\b(?:https?|ftp)://\S+|\bwww\.\S+|\b[\w-]+(?:\.[\w-]+)*\.(?:com|net|org|io|dev|app|co|me|ly|gg|ai|xyz|info|biz|us|uk|ca|de|link|site|online|store|tv)\b(?:/\S*)?', '<link>'),
+    (r'\b(?:ghp_|gho_|ghu_|ghs_|github_pat_|sk-|sk_live|pk_live|xox[abpr]-|AKIA|AIza|eyJ)[\w\-]{6,}|\b[A-Fa-f0-9]{24,}\b|\b[A-Za-z0-9+/_-]{32,}={0,2}', '<key>'),
+    (r'\b(?:token|secret|api[_ -]?key|bearer|pass(?:word|wd|code)?|pwd|pin)\s*[:=]\s*\S+', '<secret>'),
+    (r'(?:~|\.{1,2})?(?:/[\w.\-]+){2,}/?|\b[A-Za-z]:\\[^\s]+', '<path>'),
+    (r'\b\d{1,6}\s+(?:[A-Z][a-z]+\s+){1,3}(?:St|Street|Ave|Avenue|Rd|Road|Blvd|Dr|Drive|Ln|Lane|Way|Ct|Court|Pl|Place|Hwy|Highway)\b\.?', '<address>'),
+    (r'(?:\+?\d[\s().-]*){7,}', '<phone> '),   # also catches long card-like numbers
+    (r'\b\d{5,}\b', '<number>'),
+    (r'(?<![\w])@[A-Za-z0-9_]{1,30}', '<handle>'),
+    (r'\bMars(?:\s+Homestead)?\b|\bMarsHomestead\b', '<owner>'),
+]
+# final screen: same families the intake refuses; a line that still matches is dropped
+STILL_PRIVATE = re.compile(
+    r'[A-Za-z0-9._%+-]+\s*(@|\(at\)|\[at\])\s*[A-Za-z0-9.-]+\s*(\.|\(dot\)|\[dot\])\s*[A-Za-z]{2,}'
+    r'|(\+?\d[\s().-]*){7,}|\b(?:\d[ -]?){13,19}\b'
+    r'|(https?://|ftp://|www\.)|\b[a-z0-9-]+\.(com|net|org|io|dev|app|co|me|ly|gg|ai|xyz|info|biz|us|uk|ca|de|link|site|online|store|tv)\b'
+    r'|\b(pass(word|wd|code)?|pwd|passphrase|pin)\s*[:=]'
+    r'|\b(token|secret|api[_ -]?key|bearer)\s*[:=]|\b[A-Fa-f0-9]{32,}\b|\b[A-Za-z0-9+/_-]{40,}'
+    r'|(^|[^A-Za-z0-9_])@[A-Za-z0-9_]', re.I)
+
+def clean(s):
+    s = ' '.join(str(s).split())
+    for rx, rep in SUBS:
+        s = re.sub(rx, rep, s, flags=re.I if rep != '<address>' else 0)
+    s = ' '.join(s.split())[:FLEN].strip()
+    return s
+
+def h12(k, t, w, r): return hashlib.sha256(('%s|%s|%s|%s|%s' % (BOT, k, t.lower(), w.lower(), r.lower())).encode()).hexdigest()[:12]
+
+def build(c):
+    rows = c.execute("SELECT id,kind,topic,wrong,right FROM hive_item WHERE shared=0 AND status='pending' ORDER BY id").fetchall()
+    lines, ids, seen, dropped = [], [], {}, []
+    wk, r_ = iso_wk(), rid(c)
+    for i, k, t, w, r in rows:
+        t2, w2, r2 = clean(t), clean(w), clean(r)
+        if not (t2 and w2 and r2) or any(STILL_PRIVATE.search(x) for x in (t2, w2, r2)):
+            dropped.append(i); continue
+        h = h12(k, t2, w2, r2)
+        if h in seen:                       # repeat of an item already in this batch: bump n (max 3)
+            ln = lines[seen[h]]; ln['n'] = min(3, ln['n'] + 1); ids.append(i); continue
+        if len(lines) >= MAXLINES: break
+        seen[h] = len(lines)
+        lines.append({'v': 2, 'b': BOT, 'k': k, 't': t2, 'w': w2, 'r': r2, 'n': 1, 'tv': TV, 'rid': r_, 'h': h, 'wk': wk})
+        ids.append(i)
+    body = json.dumps({'batch': lines}, separators=(',', ':'), ensure_ascii=False)
+    while len(body.encode()) > MAXBODY and lines:
+        lines.pop(); ids = ids[:len(lines)]
+        body = json.dumps({'batch': lines}, separators=(',', ':'), ensure_ascii=False)
+    return lines, ids, dropped, body
+
+def post(body):
+    p = subprocess.run(['curl', '-s', '-m', '30', '-o', '-', '-w', '\n%{http_code}', '-X', 'POST',
+                        '-H', 'content-type: application/json', '--data-binary', '@-', URL],
+                       input=body, capture_output=True, text=True)
+    out = p.stdout.rsplit('\n', 1)
+    code = int(out[1]) if len(out) == 2 and out[1].isdigit() else 0
+    return code, (out[0] if out else '')[:300]
+
+def auto(c):
+    if kv(c, 'sharing') != 'on':
+        print('Hive Mind sharing is off; nothing sent.'); return 0
+    wk = iso_wk()
+    if c.execute("SELECT 1 FROM hive_send_log WHERE wk=? AND http=200", (wk,)).fetchone():
+        print('Already sent this week (%s).' % wk); return 0
+    lines, ids, dropped, body = build(c)
+    for i in dropped: c.execute("UPDATE hive_item SET status='dropped-private' WHERE id=?", (i,))
+    if not lines:
+        print('Nothing new to share.'); return 0
+    code, res = post(body)
+    c.execute('INSERT INTO hive_send_log(ts,wk,lines,http,result,body) VALUES(?,?,?,?,?,?)', (now(), wk, len(lines), code, res, body))
+    if code == 200:
+        for i in ids: c.execute("UPDATE hive_item SET shared=1, status='shared' WHERE id=?", (i,))
+        print('Sent %d line(s): %s' % (len(lines), res)); return 0
+    print('Send failed (HTTP %s): %s' % (code, res)); return 1
+
+FB_KINDS = ('bug', 'request', 'praise', 'other')
+FB_URL = URL.rstrip('/') + '/feedback'
+REPO = os.environ.get('HIVE_REPO', 'MarsHomestead/my-hive-mind')
+
+def clean_fb(s):
+    s = ' '.join(str(s).split())
+    for rx, rep in SUBS:
+        s = re.sub(rx, rep, s, flags=re.I if rep != '<address>' else 0)
+    return ' '.join(s.split())[:500].strip()
+
+def feedback_send(c, kind, text, yes):
+    if kind not in FB_KINDS:
+        print('KIND must be one of: ' + '|'.join(FB_KINDS)); return 2
+    t = clean_fb(text)
+    if not t or STILL_PRIVATE.search(t):
+        print('This text still looks private after cleaning, so it will not be sent. Please reword it.'); return 3
+    item = {'v': 1, 'b': BOT, 'kind': kind, 'text': t, 'tv': TV, 'rid': rid(c)}
+    body = json.dumps(item, separators=(',', ':'), ensure_ascii=False)
+    print('Exact text that would be sent (%s): %s' % (kind, t))
+    if not yes:
+        print('Not sent. Ask the person who wrote it; if they say yes, rerun with --yes.'); return 0
+    p = subprocess.run(['curl', '-s', '-m', '30', '-o', '-', '-w', '\n%{http_code}', '-X', 'POST',
+                        '-H', 'content-type: application/json', '--data-binary', '@-', FB_URL],
+                       input=body, capture_output=True, text=True)
+    out = p.stdout.rsplit('\n', 1)
+    code = int(out[1]) if len(out) == 2 and out[1].isdigit() else 0
+    res = (out[0] if out else '')[:300]
+    c.execute('INSERT INTO hive_send_log(ts,wk,lines,http,result,body) VALUES(?,?,?,?,?,?)',
+              (now(), 'feedback ' + iso_wk(), 1, code, res, body))
+    print(('Sent: %s' if code == 200 else 'Send failed (HTTP %s): ' % code + '%s') % res)
+    return 0 if code == 200 else 1
+
+def feedback_read(wk):
+    import difflib, base64
+    p = subprocess.run(['gh', 'api', 'repos/%s/contents/feedback/%s.jsonl' % (REPO, wk), '--jq', '.content'],
+                       capture_output=True, text=True)
+    if p.returncode != 0:
+        print('No feedback file for %s.' % wk); return 0
+    items = []
+    for line in base64.b64decode(p.stdout).decode().splitlines():
+        try: items.append(json.loads(line))
+        except Exception: pass
+    groups = {k: [] for k in FB_KINDS}
+    for it in items:
+        k = it.get('kind') if it.get('kind') in FB_KINDS else 'other'
+        txt = str(it.get('text', ''))
+        norm = ' '.join(re.sub(r'[^a-z0-9<> ]+', ' ', txt.lower()).split())
+        for g in groups[k]:
+            if difflib.SequenceMatcher(None, g['norm'], norm).ratio() >= 0.85:
+                g['count'] += 1; g['bots'].add(it.get('b', '?')); break
+        else:
+            groups[k].append({'text': txt, 'norm': norm, 'count': 1, 'bots': {it.get('b', '?')}})
+    titles = {'bug': 'Bugs', 'request': 'Requests', 'praise': 'Praise', 'other': 'Other'}
+    print('Feedback %s (%d items)' % (wk, len(items)))
+    for k in FB_KINDS:
+        print('\n%s (%d)' % (titles[k], len(groups[k])))
+        for g in sorted(groups[k], key=lambda g: -g['count']):
+            print('  - %s  [x%d, bots: %s]' % (g['text'], g['count'], ','.join(sorted(g['bots']))))
+    return 0
+
+UPD_URL = os.environ.get('HIVE_UPDATES_URL', 'https://raw.githubusercontent.com/MarsHomestead/video-studio-updates/main/updates.json')
+def vt(v): return tuple(int(x) for x in re.findall(r'\d+', v or '0'))
+def updates_list(c):
+    r = subprocess.run(['curl', '-sS', '--max-time', '20', UPD_URL], capture_output=True, text=True)
+    try: d = json.loads(r.stdout)
+    except Exception: print('Could not read the updates page.'); return 1
+    have = kv(c, 'applied_version', TV)
+    new = [u for u in d.get('updates', []) if vt(u.get('version')) > vt(have)]
+    if not new: print('Up to date (version %s).' % have); return 0
+    for u in sorted(new, key=lambda u: vt(u.get('version'))):
+        print('Version %s (%s): %s\n  %s' % (u.get('version'), u.get('date'), u.get('title'), u.get('summary')))
+        for ch in u.get('changes', []): print('  - %s' % ch)
+    print('Ask the owner before applying. After a yes: hive updates applied VERSION')
+    return 0
+
+def main(a):
+    c = con()
+    if a[:2] == ['lesson', 'add'] and len(a) == 5:
+        c.execute('INSERT INTO hive_item(kind,topic,wrong,right,created) VALUES(?,?,?,?,?)', ('lesson', a[2], a[3], a[4], now()))
+        print('Lesson saved.'); return 0
+    if a[:2] == ['feedback', 'send'] and len(a) in (4, 5) and (len(a) == 4 or a[4] == '--yes'):
+        return feedback_send(c, a[2], a[3], len(a) == 5)
+    if a[:2] == ['feedback', 'read'] and len(a) in (2, 3):
+        return feedback_read(a[2] if len(a) == 3 else iso_wk())
+    if a[:2] == ['feedback', 'add'] and len(a) == 6:
+        if a[2] not in KINDS: print('KIND must be one of: ' + '|'.join(KINDS)); return 2
+        c.execute('INSERT INTO hive_item(kind,topic,wrong,right,created) VALUES(?,?,?,?,?)', (a[2], a[3], a[4], a[5], now()))
+        print('Feedback saved.'); return 0
+    if a == ['preview']:
+        lines, ids, dropped, body = build(c)
+        print(body if lines else '(nothing would be sent)')
+        if dropped: print('# %d item(s) would be dropped as still-private' % len(dropped))
+        return 0
+    if a == ['shared']:
+        rows = c.execute('SELECT ts,wk,lines,http,result,body FROM hive_send_log ORDER BY id').fetchall()
+        if not rows: print('Nothing shared yet.')
+        for ts, wk, n, code, res, body in rows:
+            print('%s  %s  %d line(s)  HTTP %s  %s\n  %s' % (ts, wk, n, code, res, body))
+        return 0
+    if a in (['on'], ['off']):
+        setkv(c, 'sharing', a[0]); print('Hive Mind sharing is %s.' % a[0]); return 0
+    if a == ['status']:
+        p = c.execute("SELECT count(*) FROM hive_item WHERE shared=0 AND status='pending'").fetchone()[0]
+        last = c.execute('SELECT ts,http FROM hive_send_log ORDER BY id DESC LIMIT 1').fetchone()
+        print('sharing: %s | pending items: %d | last send: %s | intake: %s' % (kv(c, 'sharing'), p, last or 'never', URL))
+        return 0
+    if a == ['auto']:
+        return auto(c)
+    if a == ['updates']:
+        return updates_list(c)
+    if a[:2] == ['updates', 'applied'] and len(a) == 3:
+        setkv(c, 'applied_version', a[2]); print('Recorded: update %s applied.' % a[2]); return 0
+    print(__doc__); return 2
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))

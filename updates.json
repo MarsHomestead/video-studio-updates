@@ -1,0 +1,13 @@
+{
+  "bot": "Creative Video Studio",
+  "latest": "1.0",
+  "updates": [
+    {
+      "version": "1.0",
+      "date": "2026-11-19",
+      "title": "Update channel started",
+      "summary": "Copies now check this page weekly for improvements.",
+      "changes": []
+    }
+  ]
+}
