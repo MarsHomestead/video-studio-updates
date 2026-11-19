@@ -9,6 +9,7 @@ to the owner's own intake Worker, which appends it to her private repo.
   hive shared       every past send and its result
   hive on | hive off | hive status
   hive auto         send at most one batch per ISO week, only while on
+  hive send         same as auto; copies run it only after the owner says yes to this week's preview
   hive feedback send KIND TEXT [--yes]   one end-user item (bug|request|praise|other) to /feedback.
                     Without --yes it only shows the exact cleaned text; send with --yes ONLY after
                     the person who wrote it says yes to that text.
@@ -242,7 +243,7 @@ def main(a):
         last = c.execute('SELECT ts,http FROM hive_send_log ORDER BY id DESC LIMIT 1').fetchone()
         print('sharing: %s | pending items: %d | last send: %s | intake: %s' % (kv(c, 'sharing'), p, last or 'never', URL))
         return 0
-    if a == ['auto']:
+    if a in (['auto'], ['send']):
         return auto(c)
     if a == ['updates']:
         return updates_list(c)
